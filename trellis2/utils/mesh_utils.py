@@ -1,9 +1,71 @@
 from typing import Tuple, Dict
 import numpy as np
+import torch
+import torch.nn.functional as F
 from trimesh import grouping, util, remesh
 import struct
 import re
 from plyfile import PlyData, PlyElement
+
+
+def grid_sample_3d_cpu(
+    attrs: torch.Tensor,
+    coords: torch.Tensor,
+    shape,
+    grid: torch.Tensor,
+    mode: str = 'trilinear',
+) -> torch.Tensor:
+    """
+    CPU fallback for flex_gemm.ops.grid_sample.grid_sample_3d.
+
+    Samples sparse 3D voxel features at query positions using trilinear interpolation.
+
+    Args:
+        attrs:  [N, C] sparse feature values
+        coords: [N, 4] integer indices (batch, z, y, x)
+        shape:  either (D, H, W) or (B, C, D, H, W)
+        grid:   [1, K, 3] query positions in voxel space, (x, y, z) order
+        mode:   interpolation mode (trilinear supported)
+    Returns:
+        [1, K, C] sampled features
+    """
+    device = attrs.device
+    C = attrs.shape[-1]
+
+    if len(shape) == 3:
+        D, H, W = shape
+    elif len(shape) == 5:
+        _, _, D, H, W = shape
+    else:
+        raise ValueError(f"Unsupported shape length {len(shape)}: {shape}")
+
+    # Build dense feature grid [1, C, D, H, W]
+    dense = torch.zeros(1, C, D, H, W, dtype=torch.float32, device=device)
+    # coords: (batch, z, y, x) → z maps to D, y to H, x to W
+    z_idx = coords[:, 1].long().clamp(0, D - 1)
+    y_idx = coords[:, 2].long().clamp(0, H - 1)
+    x_idx = coords[:, 3].long().clamp(0, W - 1)
+    dense[0, :, z_idx, y_idx, x_idx] = attrs.float().T  # [C, N]
+
+    # Normalize query positions to [-1, 1] for F.grid_sample
+    # grid: [1, K, 3] with (x, y, z) order; F.grid_sample 5D expects (x→W, y→H, z→D)
+    q = grid.float()
+    gx = q[..., 0] / max(W - 1, 1) * 2 - 1
+    gy = q[..., 1] / max(H - 1, 1) * 2 - 1
+    gz = q[..., 2] / max(D - 1, 1) * 2 - 1
+    norm_grid = torch.stack([gx, gy, gz], dim=-1)       # [1, K, 3]
+    norm_grid = norm_grid.unsqueeze(1).unsqueeze(1)      # [1, 1, 1, K, 3]
+
+    # [1, C, D, H, W] sampled at [1, 1, 1, K, 3] → [1, C, 1, 1, K]
+    sampled = F.grid_sample(
+        dense,
+        norm_grid,
+        mode='bilinear',       # bilinear = trilinear for 5-D inputs
+        padding_mode='border',
+        align_corners=True,
+    )
+    # [1, C, 1, 1, K] → [1, K, C]
+    return sampled.squeeze(2).squeeze(2).permute(0, 2, 1)
 
 
 def read_ply(filename):

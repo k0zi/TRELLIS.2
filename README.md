@@ -26,7 +26,7 @@ Our 4B-parameter model generates high-resolution fully textured assets with exce
 | **1024³** | **~17s** | 10s + 7s |
 | **1536³** | **~60s** | 35s + 25s |
 
-<small>*Tested on NVIDIA H100 GPU.</small>
+<small>*Tested on NVIDIA H100 GPU. See [AMD iGPU / CPU-only Setup](#amd-igpu--cpu-only-setup) for performance on other hardware.</small>
 
 ### 2. Arbitrary Topology Handling
 The **O-Voxel** representation breaks the limits of iso-surface fields. It robustly handles complex structures without lossy conversion:
@@ -56,14 +56,16 @@ Data processing is streamlined for instant conversions that are fully **renderin
 ## 🛠️ Installation
 
 ### Prerequisites
-- **System**: The code is currently tested only on **Linux**.
-- **Hardware**: An NVIDIA GPU with at least 24GB of memory is necessary. The code has been verified on NVIDIA A100 and H100 GPUs.  
-- **Software**:   
-  - The [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit-archive) is needed to compile certain packages. Recommended version is 12.4.  
-  - [Conda](https://docs.anaconda.com/miniconda/install/#quick-command-line-install) is recommended for managing dependencies.  
-  - Python version 3.8 or higher is required. 
+- **System**: Linux.
+- **Hardware**:
+  - **NVIDIA GPU (recommended):** An NVIDIA GPU with at least 24GB of VRAM for full-speed inference. Verified on A100 and H100.
+  - **AMD iGPU / CPU (experimental):** AMD integrated GPUs (e.g., Radeon 780M) and CPU-only systems are supported via OpenGL rendering and CPU fallbacks. ROCm is **not** required. Expect significantly longer inference times (see [AMD iGPU / CPU-only Setup](#amd-igpu--cpu-only-setup)).
+- **Software**:
+  - The [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit-archive) is needed to compile certain packages on NVIDIA systems. Recommended version is 12.4.
+  - [Conda](https://docs.anaconda.com/miniconda/install/#quick-command-line-install) is recommended for managing dependencies.
+  - Python 3.8 or higher.
 
-### Installation Steps
+### Installation Steps (NVIDIA GPU)
 1. Clone the repo:
     ```sh
     git clone -b main https://github.com/microsoft/TRELLIS.2.git --recursive
@@ -99,6 +101,40 @@ Data processing is streamlined for instant conversions that are fully **renderin
         --nvdiffrec             Install nvdiffrec
     ```
 
+### AMD iGPU / CPU-only Setup
+
+No CUDA, no ROCm required. The pipeline runs entirely on CPU with OpenGL-based rendering (Mesa/RADV drivers on Linux are sufficient).
+
+1. Install CPU PyTorch and base dependencies:
+    ```sh
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+    pip install trimesh pymeshlab xatlas nvdiffrast
+    ```
+
+2. Build O-Voxel in CPU-only mode (skips all CUDA kernels):
+    ```sh
+    cd o-voxel
+    BUILD_TARGET=cpu pip install -e .
+    cd ..
+    ```
+
+3. Set environment variables before running:
+    ```sh
+    export SPARSE_CONV_BACKEND=none   # or: spconv (if spconv-cpu is installed)
+    export SPARSE_ATTN_BACKEND=none
+    export ATTN_BACKEND=none
+    export EGL_PLATFORM=surfaceless   # headless OpenGL on Linux
+    ```
+
+**Performance on AMD iGPU (approximate):**
+
+| Configuration | Inference time (512³) |
+| :--- | :--- |
+| NVIDIA H100 (CUDA) | ~3s |
+| CPU only (float32) | ~20–60 min |
+
+> **Note:** The 4B parameter model requires substantial RAM when running on CPU. 32 GB or more is recommended. Quantization (int8/int4) can reduce this significantly.
+
 ## 📦 Pretrained Weights
 
 The pretrained model **TRELLIS.2-4B** is available on Hugging Face. Please refer to the model card there for more details.
@@ -129,15 +165,17 @@ from trellis2.utils import render_utils
 from trellis2.renderers import EnvMap
 import o_voxel
 
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 # 1. Setup Environment Map
 envmap = EnvMap(torch.tensor(
     cv2.cvtColor(cv2.imread('assets/hdri/forest.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
-    dtype=torch.float32, device='cuda'
+    dtype=torch.float32, device=DEVICE
 ))
 
 # 2. Load Pipeline
 pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
-pipeline.cuda()
+pipeline.to(torch.device(DEVICE))
 
 # 3. Load Image & Run
 image = Image.open("assets/example_image/T.png")
@@ -301,12 +339,12 @@ Higher-resolution fine-tuning can be performed by updating the `finetune_ckpt` f
 
 TRELLIS.2 is built upon several specialized high-performance packages developed by our team:
 
-*   **[O-Voxel](o-voxel):** 
-    Core library handling the logic for converting between textured meshes and the O-Voxel representation, ensuring instant bidirectional transformation.
-*   **[FlexGEMM](https://github.com/JeffreyXiang/FlexGEMM):** 
-    Efficient sparse convolution implementation based on Triton, enabling rapid processing of sparse voxel structures.
-*   **[CuMesh](https://github.com/JeffreyXiang/CuMesh):** 
-    CUDA-accelerated mesh utilities used for high-speed post-processing, remeshing, decimation, and UV-unwrapping.
+*   **[O-Voxel](o-voxel):**
+    Core library handling the logic for converting between textured meshes and the O-Voxel representation, ensuring instant bidirectional transformation. Supports both CUDA and CPU-only builds (auto-detected at compile time via `setup.py`).
+*   **[FlexGEMM](https://github.com/JeffreyXiang/FlexGEMM):**
+    Efficient sparse convolution implementation based on Triton, enabling rapid processing of sparse voxel structures. On systems without CUDA, a CPU fallback is available via `SPARSE_CONV_BACKEND=none` (dense convolution) or `spconv-cpu`.
+*   **[CuMesh](https://github.com/JeffreyXiang/CuMesh):**
+    CUDA-accelerated mesh utilities used for high-speed post-processing, remeshing, decimation, and UV-unwrapping. On systems without CUDA, equivalent functionality is provided via `trimesh`, `pymeshlab`, and `xatlas`.
 
 
 ## ⚖️ License

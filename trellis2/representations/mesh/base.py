@@ -1,8 +1,8 @@
 from typing import *
 import torch
+import numpy as np
 from ..voxel import Voxel
-import cumesh
-from flex_gemm.ops.grid_sample import grid_sample_3d
+from ...utils.mesh_utils import grid_sample_3d_cpu as grid_sample_3d
 
 
 class Mesh:
@@ -33,52 +33,36 @@ class Mesh:
         return self.to('cpu')
     
     def fill_holes(self, max_hole_perimeter=3e-2):
-        vertices = self.vertices.cuda()
-        faces = self.faces.cuda()
-        
-        mesh = cumesh.CuMesh()
-        mesh.init(vertices, faces)
-        mesh.get_edges()
-        mesh.get_boundary_info()
-        if mesh.num_boundaries == 0:
-            return
-        mesh.get_vertex_edge_adjacency()
-        mesh.get_vertex_boundary_adjacency()
-        mesh.get_manifold_boundary_adjacency()
-        mesh.read_manifold_boundary_adjacency()
-        mesh.get_boundary_connected_components()
-        mesh.get_boundary_loops()
-        if mesh.num_boundary_loops == 0:
-            return
-        mesh.fill_holes(max_hole_perimeter=max_hole_perimeter)
-        new_vertices, new_faces = mesh.read()
-        
-        self.vertices = new_vertices.to(self.device)
-        self.faces = new_faces.to(self.device)
-        
+        import trimesh
+        device = self.device
+        tm = trimesh.Trimesh(
+            vertices=self.vertices.cpu().numpy(),
+            faces=self.faces.cpu().numpy(),
+            process=False,
+        )
+        trimesh.repair.fill_holes(tm)
+        self.vertices = torch.from_numpy(np.asarray(tm.vertices, dtype=np.float32)).to(device)
+        self.faces = torch.from_numpy(np.asarray(tm.faces, dtype=np.int32)).to(device)
+
     def remove_faces(self, face_mask: torch.Tensor):
-        vertices = self.vertices.cuda()
-        faces = self.faces.cuda()
-        
-        mesh = cumesh.CuMesh()
-        mesh.init(vertices, faces)
-        mesh.remove_faces(face_mask)
-        new_vertices, new_faces = mesh.read()
-        
-        self.vertices = new_vertices.to(self.device)
-        self.faces = new_faces.to(self.device)
-        
-    def simplify(self, target=1000000, verbose: bool=False, options: dict={}):
-        vertices = self.vertices.cuda()
-        faces = self.faces.cuda()
-        
-        mesh = cumesh.CuMesh()
-        mesh.init(vertices, faces)
-        mesh.simplify(target, verbose=verbose, options=options)
-        new_vertices, new_faces = mesh.read()
-        
-        self.vertices = new_vertices.to(self.device)
-        self.faces = new_faces.to(self.device)
+        device = self.device
+        kept = self.faces[face_mask.to(device).bool()]
+        unique_verts, inverse = torch.unique(kept.flatten(), return_inverse=True)
+        self.vertices = self.vertices[unique_verts]
+        self.faces = inverse.reshape(-1, 3).int()
+
+    def simplify(self, target=1000000, verbose: bool = False, options: dict = {}):
+        import pymeshlab
+        device = self.device
+        ms = pymeshlab.MeshSet()
+        ms.add_mesh(pymeshlab.Mesh(
+            vertex_matrix=self.vertices.cpu().numpy().astype(np.float64),
+            face_matrix=self.faces.cpu().numpy().astype(np.int32),
+        ))
+        ms.meshing_decimation_quadric_edge_collapse(targetfacenum=int(target))
+        m = ms.current_mesh()
+        self.vertices = torch.from_numpy(m.vertex_matrix().astype(np.float32)).to(device)
+        self.faces = torch.from_numpy(m.face_matrix().astype(np.int32)).to(device)
 
 
 class TextureFilterMode:

@@ -4,6 +4,7 @@ from easydict import EasyDict as edict
 import numpy as np
 import utils3d
 from ..representations.mesh import Mesh, MeshWithVoxel, MeshWithPbrMaterial, TextureFilterMode, AlphaMode, TextureWrapMode
+from ..utils.mesh_utils import grid_sample_3d_cpu
 import torch.nn.functional as F
 
 
@@ -18,20 +19,32 @@ def cube_to_dir(s, x, y):
 
 
 def latlong_to_cubemap(latlong_map, res):
-    if 'dr' not in globals():
+    device = latlong_map.device
+    use_cuda = str(device).startswith('cuda') and torch.cuda.is_available()
+    if use_cuda and 'dr' not in globals():
         import nvdiffrast.torch as dr
-    cubemap = torch.zeros(6, res[0], res[1], latlong_map.shape[-1], dtype=torch.float32, device='cuda')
+
+    cubemap = torch.zeros(6, res[0], res[1], latlong_map.shape[-1], dtype=torch.float32, device=device)
     for s in range(6):
-        gy, gx = torch.meshgrid(torch.linspace(-1.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device='cuda'), 
-                                torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device='cuda'),
-                                indexing='ij')
+        gy, gx = torch.meshgrid(
+            torch.linspace(-1.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device=device),
+            torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device=device),
+            indexing='ij',
+        )
         v = F.normalize(cube_to_dir(s, gx, gy), dim=-1)
 
         tu = torch.atan2(v[..., 0:1], -v[..., 2:3]) / (2 * np.pi) + 0.5
         tv = torch.acos(torch.clamp(v[..., 1:2], min=-1, max=1)) / np.pi
-        texcoord = torch.cat((tu, tv), dim=-1)
+        texcoord = torch.cat((tu, tv), dim=-1)  # [H, W, 2]
 
-        cubemap[s, ...] = dr.texture(latlong_map[None, ...], texcoord[None, ...], filter_mode='linear')[0]
+        if use_cuda:
+            cubemap[s, ...] = dr.texture(latlong_map[None, ...], texcoord[None, ...], filter_mode='linear')[0]
+        else:
+            # CPU fallback: bilinear sampling via F.grid_sample
+            grid = texcoord.unsqueeze(0) * 2 - 1  # [1, H, W, 2] in [-1, 1]
+            src = latlong_map.permute(2, 0, 1).unsqueeze(0).float()  # [1, C, H, W]
+            sampled = F.grid_sample(src, grid, mode='bilinear', padding_mode='border', align_corners=True)
+            cubemap[s, ...] = sampled[0].permute(1, 2, 0)
     return cubemap
 
 
@@ -194,10 +207,13 @@ class PbrMeshRenderer:
     Args:
         rendering_options (dict): Rendering options.
         """
-    def __init__(self, rendering_options={}, device='cuda'):
+    def __init__(self, rendering_options={}, device=None):
         if 'dr' not in globals():
             import nvdiffrast.torch as dr
-        
+
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
         self.rendering_options = edict({
             "resolution": None,
             "near": None,
@@ -206,8 +222,11 @@ class PbrMeshRenderer:
             "peel_layers": 8,
         })
         self.rendering_options.update(rendering_options)
-        self.glctx = dr.RasterizeCudaContext(device=device)
-        self.device=device
+        if device.startswith('cuda') and torch.cuda.is_available():
+            self.glctx = dr.RasterizeCudaContext(device=device)
+        else:
+            self.glctx = dr.RasterizeGLContext()
+        self.device = device
         
     def render(
             self,
@@ -322,12 +341,10 @@ class PbrMeshRenderer:
                 
                 # PBR attributes
                 if isinstance(mesh, MeshWithVoxel):
-                    if 'grid_sample_3d' not in globals():
-                        from flex_gemm.ops.grid_sample import grid_sample_3d
                     mask = rast[..., -1:] > 0
                     xyz = dr.interpolate(vertices_orig, rast, faces)[0]
                     xyz = ((xyz - mesh.origin) / mesh.voxel_size).reshape(1, -1, 3)
-                    img = grid_sample_3d(
+                    img = grid_sample_3d_cpu(
                         mesh.attrs,
                         torch.cat([torch.zeros_like(mesh.coords[..., :1]), mesh.coords], dim=-1),
                         mesh.voxel_shape,

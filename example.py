@@ -10,15 +10,17 @@ from trellis2.utils import render_utils
 from trellis2.renderers import EnvMap
 import o_voxel
 
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 # 1. Setup Environment Map
 envmap = EnvMap(torch.tensor(
     cv2.cvtColor(cv2.imread('assets/hdri/forest.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
-    dtype=torch.float32, device='cuda'
+    dtype=torch.float32, device=DEVICE,
 ))
 
 # 2. Load Pipeline
 pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
-pipeline.cuda()
+pipeline.to(torch.device(DEVICE))
 
 # 3. Load Image & Run
 image = Image.open("assets/example_image/T.png")
